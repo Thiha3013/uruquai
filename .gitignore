@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets — never commit
+keys.py
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+.claude
+
+# PennyLane / cache
+.cache/

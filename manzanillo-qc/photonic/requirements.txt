@@ -1,0 +1,14 @@
+# Photonic / continuous-variable QAOA experiments
+# Install in a SEPARATE virtual environment — do NOT mix with the main env.
+#
+#   python -m venv .venv-photonic
+#   source .venv-photonic/bin/activate
+#   pip install -r requirements.txt
+#
+# strawberryfields requires Python 3.8–3.10 and NumPy < 2.
+# It conflicts with pennylane >= 0.36 — keep them isolated.
+
+strawberryfields>=0.23.0,<0.24
+thewalrus>=0.20.0
+numpy<2
+scipy>=1.7
