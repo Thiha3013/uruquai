@@ -1,8 +1,20 @@
 """Live data pipeline: USGS catalog + FDSN station inventory → AppConfig.
 
-Replicates the data-fetching logic from quantum_exp.ipynb §1–§3 as
-importable functions, so the notebook can call ``fetch_instance()`` instead
-of embedding the raw API code inline.
+Study region
+------------
+18.3–20.8°N, 105.7–102.7°W (Manzanillo / Colima, Mexico).
+USGS M≥2.0 events 2005–2025.
+
+Pipeline
+--------
+1. Fetch USGS earthquake catalog (paginated FDSN/GeoJSON).
+2. Fetch existing FDSN stations in the study area (IRIS).
+3. Bin catalog into a 10×10 grid; compute log-energy-weighted risk per cell.
+4. Filter offshore cells using cartopy 1:10m land mask (shapely point-in-polygon).
+5. Exclude cells that already contain an existing FDSN station (same grid cell).
+6. Select top-risk + low-risk greenfield cells as candidate sites.
+7. Assign sensor type (Broadband/Short-period/MEMS) and CAPEX by risk tier.
+8. Return an AppConfig ready to pass to build_qubo().
 
 Quick start
 -----------
@@ -19,8 +31,8 @@ import pandas as pd
 from .config import AppConfig, SiteCandidate
 
 # ── Study region ───────────────────────────────────────────────────────────────
-MINLAT, MAXLAT =  18.0,  20.0
-MINLON, MAXLON = -105.0, -100.0
+MINLAT, MAXLAT =  18.3,  20.8   # Manzanillo/Colima — shifted slightly north
+MINLON, MAXLON = -105.7, -102.7  # shifted slightly east for more land coverage
 START,  END    = "2005-01-01", "2025-01-01"
 MINMAG         =  2.0
 API_LIMIT      = 19_000
@@ -28,9 +40,9 @@ API_LIMIT      = 19_000
 USGS_BASE    = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 FDSN_STATION = "https://service.iris.edu/fdsnws/station/1/query"
 
-N_LAT, N_LON = 4, 5
-N_TOP_RISK   = 5
-N_LOW_RISK   = 3
+N_LAT, N_LON = 10, 10  # finer grid: 100 cells vs 64, more candidate diversity
+N_TOP_RISK   = 8
+N_LOW_RISK   = 4
 DEFAULT_BUDGET = 25   # $250 K
 
 
@@ -118,8 +130,13 @@ def _build_risk_grid(
             })
 
     grid = pd.DataFrame(rows)
-    max_energy = grid["energy"].max()
-    grid["risk_norm"] = (grid["energy"] / max_energy).round(4) if max_energy > 0 else 0.0
+    # Log-normalise: raw energy spans ~10 orders of magnitude (M2→M7.5),
+    # so one large event crushes all smaller cells in linear space.
+    # log10(energy+1) compresses the range to ~3–11, giving meaningful
+    # risk spread across cells — standard practice in seismic hazard.
+    grid["log_energy"] = np.log10(grid["energy"] + 1)
+    max_log = grid["log_energy"].max()
+    grid["risk_norm"] = (grid["log_energy"] / max_log).round(4) if max_log > 0 else 0.0
 
     # Flag cells that already have an existing station
     grid["has_station"] = False
@@ -133,17 +150,50 @@ def _build_risk_grid(
     return grid
 
 
-def _select_candidates(grid: pd.DataFrame) -> pd.DataFrame:
-    """Pick N_TOP_RISK high-risk + N_LOW_RISK low-risk (but active) cells.
+def _is_on_land(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Return boolean array: True if point is on land (uses cartopy 1:10m)."""
+    try:
+        import cartopy.io.shapereader as shpreader
+        from shapely.geometry import Point
+        import shapely.ops
+        land_shp = shpreader.natural_earth(resolution="10m", category="physical", name="land")
+        land_geom = shapely.ops.unary_union(list(shpreader.Reader(land_shp).geometries()))
+        return np.array([land_geom.contains(Point(lon, lat)) for lat, lon in zip(lats, lons)])
+    except Exception:
+        return np.ones(len(lats), dtype=bool)
+
+
+def _select_candidates(grid: pd.DataFrame,
+                       n_top: int = N_TOP_RISK,
+                       n_low: int = N_LOW_RISK) -> pd.DataFrame:
+    """Pick n_top high-risk + n_low low-risk (but active) cells.
 
     Cells that already have an existing FDSN station are excluded — no point
     proposing a new sensor right on top of one that already exists.
+    Offshore cells are excluded via land mask.
     """
+    # Filter out offshore cells
+    on_land = _is_on_land(grid["lat_c"].values, grid["lon_c"].values)
+    grid = grid[on_land].copy()
+
     available = grid[~grid["has_station"]]   # only greenfield cells
-    top  = available.nlargest(N_TOP_RISK, "risk_norm").copy()
-    rest = available[~available.index.isin(top.index)]
-    low  = rest.nsmallest(N_LOW_RISK, "risk_norm").nlargest(N_LOW_RISK, "n_events").copy()
-    cands = pd.concat([top, low], ignore_index=True)
+    if n_top + n_low > len(available):
+        import warnings
+        warnings.warn(
+            f"Requested {n_top + n_low} candidates but only {len(available)} "
+            f"greenfield cells available in the {N_LAT}×{N_LON} grid. "
+            f"Increase N_LAT/N_LON or expand the study region.",
+            RuntimeWarning, stacklevel=3,
+        )
+    n_top = min(n_top, len(available))
+    top   = available.nlargest(n_top, "risk_norm").copy()
+    rest  = available[~available.index.isin(top.index)]
+    n_low = min(n_low, len(rest))
+    if n_low > 0:
+        low   = rest.nsmallest(n_low, "risk_norm").nlargest(n_low, "n_events").copy()
+        cands = pd.concat([top, low], ignore_index=True)
+    else:
+        cands = top.copy()
 
     def _capex(row) -> int:
         if row.risk_norm >= 0.6:   return 10   # broadband  ~$100 K
@@ -167,13 +217,19 @@ def fetch_stations() -> pd.DataFrame:
     return _fetch_stations()
 
 
-def fetch_instance(budget_10k: int = DEFAULT_BUDGET, **kwargs) -> AppConfig:
+def fetch_instance(budget_10k: int = DEFAULT_BUDGET,
+                   n_sites: int = 12,
+                   **kwargs) -> AppConfig:
     """Fetch live data and return a fully populated AppConfig.
 
     Parameters
     ----------
     budget_10k : int
         Total deployment budget in $10 K units (default 25 → $250 K).
+    n_sites : int
+        Number of candidate sites to generate (default 12).
+        Roughly 2/3 high-risk + 1/3 low-risk cells are selected.
+        Range 4–14 is well-supported by the 6×6 live grid.
     **kwargs
         Passed through to AppConfig (e.g. ``p_layers=3``, ``n_steps=300``).
 
@@ -190,8 +246,10 @@ def fetch_instance(budget_10k: int = DEFAULT_BUDGET, **kwargs) -> AppConfig:
     stations = _fetch_stations()
     print(f"  {len(stations)} existing stations in study area")
 
+    n_low = max(1, n_sites // 3)
+    n_top = n_sites - n_low
     grid  = _build_risk_grid(catalog, stations)
-    cands = _select_candidates(grid)
+    cands = _select_candidates(grid, n_top=n_top, n_low=n_low)
 
     sites = [
         SiteCandidate(

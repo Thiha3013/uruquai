@@ -4,20 +4,40 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manzanillo-qc"
-version = "0.1.0"
+version = "0.3.0"
 description = "Quantum sensor placement optimisation for the Manzanillo seismic network"
 requires-python = ">=3.10"
 dependencies = [
+    # Core quantum
     "pennylane>=0.36",
+    "pennylane-lightning>=0.36",
+    # Neutral-atom / Pulser
+    "pulser>=0.18",
+    "pulser-simulation>=0.18",
+    # D-Wave simulated annealing (CPU, no cloud)
+    "dimod>=0.12",
+    "dwave-samplers>=1.0",
+    # Classical solvers + numerics
     "numpy>=1.24",
     "pandas>=2.0",
     "scipy>=1.10",
+    # Geography
+    "cartopy>=0.21",
+    "shapely>=2.0",
+    # Plotting + data
     "matplotlib>=3.7",
     "requests>=2.28",
+    # Config
     "pydantic>=2.0",
     "pyyaml>=6.0",
-    "ortools>=9.5",
 ]
+
+[project.optional-dependencies]
+# emu-mps: MPS backend for Pulser/Pasqal at n≥16.  Large install (~2 GB with torch).
+mps = ["emu-mps>=2.6"]
+# qubo-solver: Pasqal neutral-atom QUBO solver.  Install separately (git source):
+#   pip install git+https://github.com/pasqal-io/qubo-solver
+pasqal = []
 
 [project.scripts]
 manzanillo-qc = "manzanillo_qc.cli:main"

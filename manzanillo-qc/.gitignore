@@ -1,0 +1,38 @@
+# Benchmark output
+results.json
+scaling_results.json
+scaling_pennylane_test.json
+n24_results.json
+
+# Logs
+solver.log
+n24_monitor.log
+*.log
+
+# Generated plots
+plots/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Archives
+*.zip
+
+# macOS
+.DS_Store

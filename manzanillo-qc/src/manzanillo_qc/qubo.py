@@ -1,4 +1,4 @@
-"""Build a QUBO matrix for the sensor-placement knapsack problem.
+"""Build QUBO matrices for the sensor-placement knapsack problem.
 
 Formulation (maximisation, no slack bits)
 ------------------------------------------
@@ -14,11 +14,19 @@ Expanding the penalty and collecting terms (using xᵢ² = xᵢ):
     Q[i,i] = −wᵢ  +  λ · cᵢ · (cᵢ − 2B)        (diagonal)
     Q[i,j] =          2λ · cᵢ · cⱼ  +  ρᵢⱼ       (upper triangle, i < j)
 
-λ choice
---------
-λ must exceed Σwᵢ so that any budget violation costs more than the maximum
-possible objective gain.  The default ``effective_lambda`` in AppConfig sets
-λ = 1 + Σwᵢ, which satisfies this for normalised weights ∈ [0,1].
+Two λ variants
+--------------
+build_qubo()  — default λ = 1 + Σwᵢ.
+    Conservative: guarantees feasibility is always cheaper than any budget
+    violation.  Used by gradient-based solvers (PennyLane, RQAOA, DQI) where
+    a stiff penalty landscape is fine because gradients still navigate it.
+
+build_qubo_sampling()  — calibrated λ = (Σwᵢ / min_c²) × 1.3  via
+    calibrate_lambda_for_sampling().
+    Minimum valid λ that still enforces feasibility, with a 30% safety margin.
+    For typical instances this is ~14x smaller than the default, keeping the
+    objective signal visible to sampling-based solvers (Pulser, Pasqal) that
+    cannot distinguish solution quality when the penalty dominates.
 
 Overlap / redundancy model
 --------------------------
@@ -30,7 +38,7 @@ matrix ρ (upper-triangle) from geographic distance and sensor detection radii.
     ρᵢⱼ        = overlap_ij · min(wᵢ, wⱼ)
 
 Adding ρᵢⱼ to Q[i,j] discourages co-deploying sensors whose footprints
-significantly overlap — only pay the cost if the marginal coverage is worth it.
+significantly overlap.
 """
 from __future__ import annotations
 
@@ -90,56 +98,118 @@ def compute_overlap(cfg: AppConfig) -> np.ndarray:
 # ── QUBO builder ───────────────────────────────────────────────────────────────
 
 def build_qubo(cfg: AppConfig, overlap: bool = False) -> tuple[np.ndarray, dict]:
-    """Return the QUBO matrix Q and a metadata dict.
+    """Build the shared QUBO matrix for all QUBO-based solvers.
 
-    Parameters
-    ----------
-    cfg : AppConfig
-        Populated configuration with sites, budget, and lambda.
-    overlap : bool
-        If True, add the pairwise redundancy penalty from ``compute_overlap``.
-        Discourages deploying sensors with overlapping detection footprints.
+    Objective:
+        min  -sum_i w_i x_i
+             + lam * (sum_i c_i x_i - B)^2
+             + eps * sum_i x_i
+             + optional overlap penalty
 
-    Returns
-    -------
-    Q : np.ndarray, shape (n, n)
-        Upper-triangular QUBO matrix (Q[i,j] = 0 for i > j).
-    meta : dict
-        Summary statistics: n_qubits, lambda, budget, q_min, q_max, overlap.
+    The tiny eps * sum_i x_i term is a shared cardinality bias:
+    when two solutions are otherwise very close, it slightly prefers
+    using fewer selected sites.
+    """
+    n = cfg.n_sites                                   # number of candidate sites
+    w = cfg.weights                                   # risk/utility weights
+    c = cfg.costs                                     # site costs
+    B = float(cfg.budget_10k)                         # budget in $10K units
+    lam = cfg.effective_lambda                        # soft-budget penalty strength
+
+    eps = 1e-2                                        # tiny shared cardinality tie-breaker
+
+    Q = np.zeros((n, n), dtype=float)                 # upper-triangular QUBO matrix
+
+    for i in range(n):                                # fill diagonal terms
+        Q[i, i] -= w[i]                               # objective reward: maximize weight -> minimize -weight
+        Q[i, i] += eps                                # tiny penalty per selected site (cardinality bias)
+        Q[i, i] += lam * c[i] * (c[i] - 2 * B)       # diagonal part of budget penalty expansion
+
+    for i in range(n):                                # fill off-diagonal coupling terms
+        for j in range(i + 1, n):
+            Q[i, j] += 2 * lam * c[i] * c[j]         # off-diagonal part of budget penalty expansion
+
+    if overlap:                                       # optionally add overlap penalties
+        rho = compute_overlap(cfg)                    # get overlap penalty matrix
+        Q += rho                                      # add it into the shared QUBO
+
+    meta = {                                          # metadata for reporting/debugging
+        "n_qubits": n,
+        "lambda": lam,
+        "budget": B,
+        "overlap": overlap,
+        "q_min": float(Q.min()),
+        "q_max": float(Q.max()),
+        "tie_break_mode": "cardinality",
+        "tie_break_eps": eps,
+    }
+    return Q, meta                                    # return QUBO and metadata
+
+
+# ── Sampling-solver QUBO ───────────────────────────────────────────────────────
+
+def calibrate_lambda_for_sampling(cfg: AppConfig, margin: float = 0.30) -> float:
+    """Minimum valid lambda for sampling-based neutral-atom solvers.
+
+    The conservative default lambda = 1 + sum(w) makes the QUBO ~10-15x stiffer
+    than needed, burying the objective signal under the penalty.  For Pasqal and
+    Pulser (sampling-based) the minimum-valid lambda is used instead:
+
+        lam_min = sum(w) / min(c)^2
+
+    This guarantees that the penalty for exceeding the budget by the smallest
+    possible amount (one minimum-cost site) still exceeds the maximum achievable
+    objective gain.  A safety margin of (1 + margin) is added on top.
+    """
+    c = cfg.costs
+    w = cfg.weights
+    min_c = float(c.min())
+    sum_w = float(w.sum())
+    lam_min = sum_w / (min_c ** 2) if min_c > 0 else 1.0
+    return lam_min * (1.0 + margin)
+
+
+def build_qubo_sampling(cfg: AppConfig, margin: float = 0.30,
+                        overlap: bool = False) -> tuple[np.ndarray, dict]:
+    """Build QUBO with calibrated minimum lambda for sampling-based solvers.
+
+    Same (Q, meta) tuple as build_qubo() but uses the smallest lambda that still
+    enforces feasibility.  This avoids burying the objective signal under a
+    penalty that is 10-15x larger than necessary.
+
+    Use this instead of build_qubo() for Pasqal and Pulser.
     """
     n   = cfg.n_sites
     w   = cfg.weights
     c   = cfg.costs
     B   = float(cfg.budget_10k)
-    lam = cfg.effective_lambda
+    lam = calibrate_lambda_for_sampling(cfg, margin=margin)
+    eps = 1e-2
 
-    Q = np.zeros((n, n))
-
-    # Objective term: −wᵢ on sensor diagonals
+    Q = np.zeros((n, n), dtype=float)
     for i in range(n):
         Q[i, i] -= w[i]
-
-    # Penalty diagonal: λ·cᵢ·(cᵢ − 2B)
-    for i in range(n):
+        Q[i, i] += eps
         Q[i, i] += lam * c[i] * (c[i] - 2 * B)
-
-    # Penalty off-diagonal: 2λ·cᵢ·cⱼ
     for i in range(n):
         for j in range(i + 1, n):
             Q[i, j] += 2 * lam * c[i] * c[j]
 
-    # Optional: add pairwise redundancy penalties
     if overlap:
         rho = compute_overlap(cfg)
-        Q += rho   # rho is already upper-triangular
+        Q += rho
 
     meta = {
-        "n_qubits": n,
-        "lambda":   lam,
-        "budget":   B,
-        "overlap":  overlap,
-        "q_min":    float(Q.min()),
-        "q_max":    float(Q.max()),
+        "n_qubits":      n,
+        "lambda":        lam,
+        "lambda_default": 1.0 + float(w.sum()),
+        "lambda_source": "calibrated_sampling",
+        "budget":        B,
+        "overlap":       overlap,
+        "q_min":         float(Q.min()),
+        "q_max":         float(Q.max()),
+        "tie_break_mode": "cardinality",
+        "tie_break_eps": eps,
     }
     return Q, meta
 

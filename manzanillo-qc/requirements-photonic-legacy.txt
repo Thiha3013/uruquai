@@ -1,5 +1,0 @@
-# Legacy photonic backend — only needed for Strawberry Fields / Xanadu X8 hardware.
-# Install alongside requirements.txt if you want photonic simulation:
-#   pip install -r requirements.txt -r requirements-photonic-legacy.txt
-strawberryfields>=0.23
-thewalrus>=0.20
