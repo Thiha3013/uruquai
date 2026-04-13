@@ -84,20 +84,6 @@ cd manzanillo-qc
 PYTHONPATH=src python3 run_dqi.py
 ```
 
-### n=24 overnight run
-
-Open [src/manzanillo_qc/scaling.py](src/manzanillo_qc/scaling.py) and
-uncomment these two lines (around line 417):
-
-```python
-run_n24_monitored(sites_sorted, p=p, steps=steps)
-return
-```
-
-Then run in background. The run logs every step to `n24_monitor.log` with ETA,
-and saves final results to `n24_results.json`. Uses INTERP staged warm-start
-(p=1→6) and MPSBackend automatically at n≥16.
-
 ### Single-run CLI
 
 ```bash
