@@ -1,12 +1,14 @@
 """Pasqal QUBO solver wrapper (qubo-solver package).
 
-Uses Pasqal's qubo-solver library with a local neutral-atom emulator backend.
-No cloud credentials required.
-
 Backend selection
 -----------------
-N < _PASQAL_MPS_N : LocalEmulator (QutipBackendV2, statevector — fast at small n)
-N >= _PASQAL_MPS_N: LocalEmulator (MPSBackend / emu-mps, MPS — scales as n×χ²)
+Cloud (PASQAL_USERNAME + PASQAL_PASSWORD env vars set):
+    RemoteEmulator on Pasqal Cloud — no local GPU needed, scales further.
+    Project ID read from PASQAL_PROJECT_ID env var (default hard-coded below).
+
+Local fallback (no credentials):
+    N < _PASQAL_MPS_N : LocalEmulator (QutipBackendV2, statevector)
+    N >= _PASQAL_MPS_N: LocalEmulator (MPSBackend / emu-mps, MPS — scales as n×χ²)
 
 The solver embeds the QUBO into a neutral-atom register, shapes an adiabatic
 drive pulse, runs the quantum emulation, and samples 2000 bitstrings from the
@@ -37,12 +39,20 @@ to each diagonal to break this symmetry.
 Returns the same dict format as run_qaoa() so it slots straight into
 the benchmark table.
 
+Credentials (cloud mode)
+------------------------
+Set environment variables before running:
+    export PASQAL_USERNAME="your@email.com"
+    export PASQAL_PASSWORD="yourpassword"
+    export PASQAL_PROJECT_ID="3f5d4450-6db4-4463-a1f7-2710577ed7d0"  # optional
+
 Install:
     pip install git+https://github.com/pasqal-io/qubo-solver
-    pip install emu-mps   (already installed — needed for n >= _PASQAL_MPS_N)
+    pip install emu-mps   (needed for local n >= _PASQAL_MPS_N)
 """
 from __future__ import annotations
 
+import os
 import time
 import numpy as np
 
@@ -52,6 +62,7 @@ from .qubo import build_qubo_sampling, calibrate_lambda_for_sampling
 _N_RUNS = 2000      # bitstring samples from the emulator (more = better repair diversity)
 _PASQAL_MPS_N   = 16   # switch to MPSBackend above this qubit count
 _MPS_MAX_BOND_DIM = 256
+_DEFAULT_PROJECT_ID = "3f5d4450-6db4-4463-a1f7-2710577ed7d0"
 
 
 def run_pasqal_qubo(cfg: AppConfig, Q: np.ndarray) -> dict:
@@ -79,25 +90,10 @@ def run_pasqal_qubo(cfg: AppConfig, Q: np.ndarray) -> dict:
         )
 
     N = len(cfg.sites)
-    use_mps = N >= _PASQAL_MPS_N
-    if use_mps:
-        try:
-            from emu_mps import MPSBackend, MPSConfig
-        except ImportError:
-            use_mps = False
-
     c = cfg.costs
     B = float(cfg.budget_10k)
     w = cfg.weights
-    # N already set above
 
-    # Rebuild QUBO with calibrated minimum lambda for sampling.
-    # The shared build_qubo() uses lambda = 1 + sum(w) ~ 7, making the penalty
-    # ~15x larger than needed; this buries the objective signal and causes the
-    # emulator to sample almost exclusively infeasible bitstrings.
-    # calibrate_lambda_for_sampling() returns lam_min * 1.3 which is the smallest
-    # lambda that still guarantees any budget violation costs more than the best
-    # feasible objective.
     lam_default = 1.0 + float(w.sum())
     lam_cal     = calibrate_lambda_for_sampling(cfg)
     Q_cal, _    = build_qubo_sampling(cfg)
@@ -108,14 +104,6 @@ def run_pasqal_qubo(cfg: AppConfig, Q: np.ndarray) -> dict:
     Q_sym = (Q_cal + Q_cal.T) / 2
 
     # Break the (kc−B)²=((k+1)c−B)² penalty symmetry.
-    # When all site costs are equal (e.g. c=10, B=55), selecting k sites and
-    # k+1 sites produce identical penalty values, so the QUBO minimum favours
-    # the over-budget (k+1) solution since it has higher coverage reward.
-    # Adding a tiny cost-proportional term μ·cᵢ to each diagonal makes
-    # over-budget selections marginally more expensive than their symmetric
-    # feasible counterparts, guiding the emulator toward feasible bitstrings.
-    # μ is chosen as 1e-3 × (typical Q scale) / max_c so it is large enough
-    # to break symmetry but negligible compared to objective differences.
     q_abs_max = max(float(np.abs(Q_sym).max()), 1.0)
     mu = 1e-3 * q_abs_max / max(float(c.max()), 1.0)
     Q_asym = Q_sym.copy()
@@ -126,13 +114,46 @@ def run_pasqal_qubo(cfg: AppConfig, Q: np.ndarray) -> dict:
     q_scale = max(float(np.abs(Q_asym).max()), 1.0)
     Q_scaled = Q_asym / q_scale
 
-    if use_mps:
-        backend_label = f"MPS chi={_MPS_MAX_BOND_DIM}"
-        mps_cfg = MPSConfig(max_bond_dim=_MPS_MAX_BOND_DIM)
-        backend = LocalEmulator(backend_type=MPSBackend, emulation_config=mps_cfg, runs=_N_RUNS)
-    else:
-        backend_label = "QutipBackendV2"
-        backend = LocalEmulator(runs=_N_RUNS)
+    # --- Backend selection: cloud if credentials present, else local ---
+    username   = os.environ.get("PASQAL_USERNAME", "")
+    password   = os.environ.get("PASQAL_PASSWORD", "")
+    project_id = os.environ.get("PASQAL_PROJECT_ID", _DEFAULT_PROJECT_ID)
+    use_cloud  = bool(username and password)
+
+    if use_cloud:
+        try:
+            from pulser_pasqal import PasqalCloud
+            from pulser.backend import BitStrings, EmulationConfig
+            from qoolqit.execution.backends import RemoteEmulator
+            connection = PasqalCloud(
+                username=username,
+                password=password,
+                project_id=project_id,
+            )
+            shot_config = EmulationConfig(observables=[BitStrings(num_shots=_N_RUNS)])
+            backend = RemoteEmulator(connection=connection, emulation_config=shot_config)
+            backend_label = f"RemoteEmulator (cloud project={project_id[:8]}…)"
+        except Exception as exc:
+            print(f"  Pasqal cloud init failed ({exc}), falling back to local.")
+            use_cloud = False
+
+    if not use_cloud:
+        use_mps = N >= _PASQAL_MPS_N
+        if use_mps:
+            try:
+                from emu_mps import MPSBackend, MPSConfig
+            except ImportError:
+                use_mps = False
+        import warnings as _w
+        if use_mps:
+            backend_label = f"MPS chi={_MPS_MAX_BOND_DIM}"
+            mps_cfg = MPSConfig(max_bond_dim=_MPS_MAX_BOND_DIM)
+            with _w.catch_warnings():
+                _w.simplefilter("ignore")
+                backend = LocalEmulator(backend_type=MPSBackend, emulation_config=mps_cfg, runs=_N_RUNS)
+        else:
+            backend_label = "QutipBackendV2"
+            backend = LocalEmulator(runs=_N_RUNS)
 
     print(f"  Pasqal  n={N}  runs={_N_RUNS}  backend={backend_label}  "
           f"budget=${B*10:.0f}K  mu={mu:.4f}")
@@ -145,12 +166,18 @@ def run_pasqal_qubo(cfg: AppConfig, Q: np.ndarray) -> dict:
         do_postprocessing=True,
     )
     import logging as _logging
-    _ql_log = _logging.getLogger("qoolqit")
-    _prev_level = _ql_log.level
-    _ql_log.setLevel(_logging.ERROR)   # suppress "runs specified in both" warning
-    solver = QuboSolver(instance=instance, config=config)
-    solution = solver.solve()
-    _ql_log.setLevel(_prev_level)
+    import warnings as _warnings
+    _ql_log   = _logging.getLogger("qoolqit")
+    _root_log = _logging.getLogger()
+    _prev_ql, _prev_root = _ql_log.level, _root_log.level
+    _ql_log.setLevel(_logging.ERROR)
+    _root_log.setLevel(_logging.ERROR)
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        solver = QuboSolver(instance=instance, config=config)
+        solution = solver.solve()
+    _ql_log.setLevel(_prev_ql)
+    _root_log.setLevel(_prev_root)
     t_ms = (time.perf_counter() - t0) * 1000
 
     # qubosolver.solve() may return a single bitstring of shape (n,)

@@ -46,7 +46,8 @@ from .qaoa import run_qaoa
 from .benchmarks import greedy, milp_solve, plot_sensor_map
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
-QUBIT_COUNTS = [4, 6, 8, 10, 12]
+#QUBIT_COUNTS = [4, 6, 8, 10, 12, 14]
+#QUBIT_COUNTS = [16]
 #QUBIT_COUNTS = [24]   # standalone large-n stress test — swap in when ready
 BUDGET_10K      = 80          # $800K — allows ~6-8 sensors, scales better with n
 
