@@ -46,7 +46,7 @@ from .qaoa import run_qaoa
 from .benchmarks import greedy, milp_solve, plot_sensor_map
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
-#QUBIT_COUNTS = [4, 6, 8, 10, 12, 14]
+QUBIT_COUNTS = [4, 6, 8, 10, 12, 14, 16, 18]
 #QUBIT_COUNTS = [16]
 #QUBIT_COUNTS = [24]   # standalone large-n stress test — swap in when ready
 BUDGET_10K      = 80          # $800K — allows ~6-8 sensors, scales better with n
@@ -162,6 +162,7 @@ def _run_n(sites_sorted: list, n: int,
                 "converged": pr["convergence"]["reached"],
                 "conv_step": pr["convergence"]["iter"],
                 "best_prob": pr.get("best_prob"),
+                "x":         pr.get("best_x"),
             }
         except Exception as e:
             pulser_row = {"error": str(e),
@@ -184,6 +185,7 @@ def _run_n(sites_sorted: list, n: int,
                 "converged": True,
                 "conv_step": None,
                 "best_prob": None,
+                "x":         pq.get("best_x"),
             }
         except Exception as e:
             pasqal_row = {"error": str(e),
