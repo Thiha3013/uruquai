@@ -47,8 +47,19 @@ If you skip this step, the data catalog notebook will still run — datasets
 that require authentication will be marked `FILE_AUTH / MANUAL` instead of
 validated.
 
-The manzanillo-qc benchmark does **not** need any API keys (it uses the public
+The manzanillo-qc benchmark does **not** need these keys (it uses the public
 USGS and IRIS FDSN services).
+
+To run the Pasqal solver on real cloud hardware instead of the local emulator,
+set these environment variables before running:
+
+```bash
+export PASQAL_USERNAME="your@email.com"
+export PASQAL_PASSWORD="yourpassword"
+export PASQAL_PROJECT_ID="..."   # optional
+```
+
+Without them the solver falls back to the local neutral-atom emulator automatically.
 
 ---
 
